@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WordPress plugin: WooCommerce payment gateway for [QvaPay](https://www.qvapay.com). Single-flow integration (invoice + redirect) using QvaPay's merchants API v2. USD-only.
 
-Plain PHP loaded by WordPress — no `composer.json`, no `package.json`, no test suite. Don't introduce one unless asked. The only tooling is `build.sh` (produces the release zip) and `.github/workflows/release.yml` (attaches the zip to a GitHub Release when a `v*` tag is pushed).
+Plain PHP loaded by WordPress — no `composer.json`, no `package.json`, no unit-test framework. Don't introduce one unless asked. Tooling: `build.sh` (produces the release zip), `.github/workflows/release.yml` (attaches the zip to a GitHub Release when a `v*` tag is pushed), and `tests/e2e/run.sh` — end-to-end webhook scenarios against a throwaway WordPress + WooCommerce in Docker (checkout, WooCommerce's real "Pay for this order" handler, signed webhooks over HTTP; QvaPay's `create_invoice` is stubbed by `tests/e2e/mu-plugins/`). Run it after touching `process_payment()` or the webhook; it exits non-zero on any failed expectation. `tests/` is not shipped (not in `SHIP`, `export-ignore`d).
 
 ## Architecture
 
@@ -31,7 +31,7 @@ The Blocks JS (`assets/js/checkout-blocks.js`) is intentionally minimal: no `onP
 
 Required script deps: `wc-blocks-registry`, `wc-settings`, `wp-element`, `wp-html-entities`, `wp-i18n`. Missing `wc-settings` is what makes `getSetting('qvapay_data', {})` silently return empty. The data key is `<name>_data` derived from `protected $name = 'qvapay'`.
 
-Settings live in the single option `woocommerce_qvapay_settings` (deleted by `uninstall.php`). Per-order state is one meta key: `_qvapay_transaction_uuid` (constant `QvaPay_Gateway::ORDER_META_TXN_UUID`).
+Settings live in the single option `woocommerce_qvapay_settings` (deleted by `uninstall.php`). Per-order state is two meta keys: `_qvapay_invoices` (`QvaPay_Gateway::ORDER_META_INVOICES`), a `uuid => amount` map of every invoice issued for the order, and `_qvapay_transaction_uuid` (`QvaPay_Gateway::ORDER_META_TXN_UUID`), the latest one. WooCommerce's "Pay for this order" calls `process_payment()` again on a pending order, so one order can have several live invoices.
 
 ### Webhook URL resolution
 
@@ -51,9 +51,11 @@ The webhook handler in `includes/class-qvapay-webhook.php` enforces, in order:
 - Presence of body + `x-qvapay-signature` + `x-qvapay-timestamp` headers. WP normalizes header names, so `WP_REST_Request::get_header()` is called with underscores (`x_qvapay_signature`, `x_qvapay_timestamp`) — don't change these to dashes.
 - `|now - timestamp| ≤ TIMESTAMP_TOLERANCE` (300 s) — anti-replay window.
 - Signature must be `sha256=` + `hash_hmac('sha256', raw_body, app_secret)`, compared with `hash_equals` (timing-safe). Signature is computed over the **raw** body — never re-encode the JSON before hashing.
-- Order lookup via `remote_id` (= WC order id). If `_qvapay_transaction_uuid` is stored on the order, it must match the incoming uuid.
+- Serialization: everything that reads or changes the order runs in `apply_to_order()` under a per-order MySQL named lock (`GET_LOCK`, `ORDER_LOCK_TIMEOUT` = 10 s); the order is loaded only after the lock is held. Lock names are server-wide, so `order_lock_name()` builds them from the database name + table prefix (hashed, to stay under 64 chars) + order id — two stores on one MySQL server can share the prefix and order ids. Two invoices of one order (or a redelivery) can arrive together, and without the lock a stale short payment could pass the "already paid?" check and put a just-paid order back `on-hold`. Lock timeout (`GET_LOCK` = 0) → 503 `order_busy` so QvaPay retries. `GET_LOCK` returning NULL or erroring (databases without named locks: some clusters and proxies) → logged and processed unserialized — never turn that into a 503, or no payment would ever complete on those hosts. Keep any new status change inside `apply_to_order()`.
+- Order lookup via `remote_id` (= WC order id). The incoming uuid must be one of the invoices issued for the order (`_qvapay_invoices`, plus `_qvapay_transaction_uuid` for orders from before the map existed); anything else is `uuid_mismatch` (400). Never narrow this back to "the latest uuid": the customer may pay an earlier invoice, and QvaPay would retry the rejection forever.
 - Idempotency: if the order `is_paid()` or status is `processing` / `completed` / `refunded`, the handler returns 200 with `already_processed=true` and does **not** call `payment_complete()` again. Preserve this — QvaPay retries.
-- Only `status === 'paid'` triggers `$order->payment_complete($uuid)`; other statuses are logged and acknowledged with 200.
+- A `paid` webhook for an already-paid order with a different uuid (both invoices paid) adds an order note so the merchant can refund one — once per uuid (`_qvapay_extra_payments`), since QvaPay can redeliver.
+- Only `status === 'paid'` triggers `$order->payment_complete($uuid)`, and only if the paid amount covers the current order total. The amount is the one stored in `_qvapay_invoices` when the invoice was issued; for a pre-map (v1.0.0) invoice, whose stored amount is `null`, it falls back to the signed webhook's `amount`. Short → `on-hold` + note, 200 `amount_short`; no amount at all → `on-hold` + note, 200 `amount_unverified`. Never let an unverifiable amount complete an order. Other statuses are logged and acknowledged with 200.
 
 The qpweb backend signs the webhook via `sendAppWebhook(url, payload, { app_id, secret })` — the `secret` arg is what triggers `x-qvapay-signature` + `x-qvapay-timestamp` headers in `scripts/webhook.js`. Callers must pass `secret: transaction.App.secret`. Adding the headers is backward-compatible: existing merchants that don't validate them simply ignore the extra headers.
 
